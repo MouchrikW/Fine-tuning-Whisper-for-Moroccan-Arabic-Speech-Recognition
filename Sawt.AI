@@ -1,0 +1,169 @@
+import os
+import pandas as pd
+from datasets import Dataset, Audio, concatenate_datasets
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    GenerationConfig,
+    EarlyStoppingCallback
+)
+import torch
+from dataclasses import dataclass
+from typing import Any
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import evaluate
+
+def load_data(csv_file, wav_dir):
+    df = pd.read_csv(csv_file, sep='\t')
+    df = df.dropna(subset=['wav', 'words'])
+    df['audio'] = df['wav'].apply(lambda x: os.path.join(wav_dir, x))
+    df = df[df['audio'].apply(os.path.exists)]
+    df = df.rename(columns={'words': 'transcription'})
+    df = df[['audio', 'transcription']]
+    dataset = Dataset.from_pandas(df)
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    return dataset
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+
+    def __call__(self, features):
+        input_features = []
+        label_features = []
+
+        for feature in features:
+            speech_array = feature["audio"]["array"]
+            sampling_rate = feature["audio"]["sampling_rate"]
+
+            input_feature = self.processor.feature_extractor(
+                speech_array, sampling_rate=sampling_rate, return_tensors="pt"
+            ).input_features[0]
+            input_features.append({"input_features": input_feature})
+
+            labels = self.processor.tokenizer(
+                feature["transcription"], return_tensors="pt"
+            ).input_ids[0]
+            label_features.append({"input_ids": labels})
+
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt", padding=True)
+
+        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
+        batch["labels"] = labels
+
+        return batch
+
+def evaluate_model(model, dataset, processor, device, generation_config):
+    model.eval()
+    wer_metric = evaluate.load("wer")
+    dataloader = DataLoader(
+        dataset,
+        batch_size=2,
+        collate_fn=data_collator,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    predictions = []
+    references = []
+
+    for batch in tqdm(dataloader, desc="Evaluating"):
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_features=batch["input_features"],
+                attention_mask=torch.ones_like(batch["input_features"], dtype=torch.long),
+                generation_config=generation_config,
+            )
+
+        pred_str = processor.batch_decode(outputs, skip_special_tokens=True)
+        label_ids = batch["labels"]
+        label_ids = label_ids.cpu().numpy()
+        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+        label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
+
+        predictions.extend(pred_str)
+        references.extend(label_str)
+
+    wer = wer_metric.compute(predictions=predictions, references=references)
+    print(f"WER on test dataset: {wer}")
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    wav_dir = r'.\\6342622\\v2.0.darija\\darija\\wavs'
+    texts_dir = r'.\\6342622\\v2.0.darija\\darija\\texts'
+
+    train_csv = os.path.join(texts_dir, 'train.csv')
+    dev_csv = os.path.join(texts_dir, 'dev.csv')
+    test_csv = os.path.join(texts_dir, 'test.csv')
+
+    train_dataset = load_data(train_csv, wav_dir)
+    dev_dataset = load_data(dev_csv, wav_dir)
+    test_dataset = load_data(test_csv, wav_dir)
+
+    train_dataset = concatenate_datasets([train_dataset, dev_dataset])
+
+    model_name = r".\\whisper-darija\\llm_model"
+
+    processor = WhisperProcessor.from_pretrained(model_name, language="Arabic", task="transcribe")
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model.to(device)
+
+    model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="Arabic", task="transcribe")
+
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+    generation_config = GenerationConfig.from_pretrained(model_name)
+    generation_config.max_length = 225
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=r".\\whisper-darija\\llm_model_finetuned",
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=1e-5,
+        warmup_steps=200,
+        max_steps=1000,
+        gradient_checkpointing=True,
+        fp16=True,
+        evaluation_strategy="steps",
+        eval_steps=100,
+        save_strategy="steps",
+        save_steps=100,
+        logging_steps=50,
+        save_total_limit=2,
+        dataloader_num_workers=4,
+        predict_with_generate=False,
+        generation_max_length=225,
+        push_to_hub=False,
+        remove_unused_columns=False,
+        dataloader_pin_memory=True,
+    )
+
+    trainer = Seq2SeqTrainer(
+        args=training_args,
+        model=model,
+        train_dataset=train_dataset,
+        eval_dataset=dev_dataset,  # Include evaluation dataset
+        data_collator=data_collator,
+    )
+
+    trainer.train()
+
+    output_dir = r".\\whisper-darija\\llm_model_finetuned"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Saving model to {output_dir}")
+    trainer.save_model(output_dir)
+    processor.save_pretrained(output_dir)
+    print("Model and processor have been saved successfully.")
+
+    evaluate_model(model, test_dataset, processor, device, generation_config)
